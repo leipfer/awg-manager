@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+awg-split — раздельное туннелирование по IP для AWG Manager.
+
+ПОЧЕМУ ПРЕЖНЯЯ ВЕРСИЯ НЕ РАБОТАЛА
+---------------------------------
+При `AllowedIPs = 0.0.0.0/0` awg-quick/wg-quick не кладёт маршрут по
+умолчанию в таблицу main, а создаёт политику маршрутизации:
+
+    32764: from all lookup main suppress_prefixlength 0
+    32765: not from all fwmark 0xca6c lookup 51820   <- весь трафик в туннель
+
+Правило 32765 перехватывает ВЕСЬ неотмеченный трафик. Прежняя версия
+лишь добавляла свои маршруты, не перекрывая этот перехват, поэтому
+режим «только список» не действовал вовсе.
+
+КАК СДЕЛАНО СЕЙЧАС
+------------------
+Обе таблицы создаём сами и ставим правила с приоритетом НИЖЕ (то есть
+раньше по обработке), чем правила wg-quick:
+
+    18000  to <net> lookup 51821   include: перечисленное → в туннель
+    18000  to <net> lookup 51822   exclude: перечисленное → напрямую
+    18500  from all lookup 51822   include: всё остальное → напрямую
+
+    таблица 51821: default dev <iface>              (через VPN)
+    таблица 51822: default via <gw> dev <wan>       (мимо VPN)
+
+Правило 18500 в режиме include гасит перехват wg-quick, не трогая его
+собственные правила: до 32765 очередь просто не доходит. Трафик самого
+туннеля (UDP на endpoint) уходит через 18500 → реальный шлюз, что и
+требуется.
+
+Домены резолвятся в IP при каждом применении; адреса запрашиваются
+в обход туннеля, чтобы получить «честный» ответ провайдера.
+
+Состояние: /etc/awg-manager/split.json
+"""
+
+import concurrent.futures
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+STATE_DIR = "/etc/awg-manager"
+STATE_FILE = os.path.join(STATE_DIR, "split.json")
+
+TABLE_VPN = 51821      # default через туннель
+TABLE_DIRECT = 51822   # default мимо туннеля
+PRIO_NETS = 18000      # правила для перечисленных подсетей
+PRIO_REST = 18500      # include: всё остальное — напрямую
+
+# публичные резолверы на случай, если системный DNS отвечает через туннель
+FALLBACK_DNS = ["77.88.8.8", "1.1.1.1", "8.8.8.8"]
+
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+IP = shutil.which("ip") or "/usr/sbin/ip"
+DIG = shutil.which("dig")
+GETENT = shutil.which("getent") or "/usr/bin/getent"
+
+IFACE_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+
+
+def run(cmd, check=False, timeout=25):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       env=dict(os.environ, LC_ALL="C"))
+    if check and p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip())
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+# --------------------------------------------------------------------------- #
+# состояние
+# --------------------------------------------------------------------------- #
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return {
+                "mode": data.get("mode", "off"),
+                "entries": [e for e in data.get("entries", []) if isinstance(e, str)],
+                "resolved": data.get("resolved", {}) if isinstance(
+                    data.get("resolved"), dict) else {},
+                "iface": data.get("iface") or "",
+                "auto": bool(data.get("auto", True)),
+            }
+    except (OSError, ValueError):
+        pass
+    return {"mode": "off", "entries": [], "resolved": {}, "iface": "", "auto": True}
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE_FILE)
+
+
+# --------------------------------------------------------------------------- #
+# разбор записей: подсети и домены
+# --------------------------------------------------------------------------- #
+def clean_domain(raw):
+    """Привести https://site.com/path?x=1 к site.com."""
+    s = raw.strip().lower()
+    s = re.sub(r"^[a-z][a-z0-9+.-]*://", "", s)
+    s = s.split("/")[0].split("?")[0].split("#")[0]
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    s = s.split(":")[0].strip(".")
+    return s
+
+
+def classify(entries):
+    """Разделить записи на подсети и домены. Возвращает (nets, domains, bad)."""
+    nets, domains, bad = [], [], []
+    for raw in entries:
+        raw = (raw or "").strip()
+        if not raw or raw.startswith("#"):
+            continue
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+            if net.version != 4:
+                bad.append(raw)
+            elif str(net) not in nets:
+                nets.append(str(net))
+            continue
+        except ValueError:
+            pass
+        dom = clean_domain(raw)
+        if DOMAIN_RE.match(dom):
+            if dom not in domains:
+                domains.append(dom)
+        else:
+            bad.append(raw)
+    return nets, domains, bad
+
+
+def resolve_domain(domain):
+    """Все A-записи домена. Запрос идёт мимо туннеля, если доступен dig."""
+    found = set()
+
+    if DIG:
+        for server in FALLBACK_DNS:
+            try:
+                rc, out, _ = run(
+                    [DIG, "+short", "+time=3", "+tries=1", "@" + server, "A", domain],
+                    timeout=8,
+                )
+                if rc == 0:
+                    for line in out.splitlines():
+                        line = line.strip()
+                        try:
+                            ipaddress.IPv4Address(line)
+                            found.add(line)
+                        except ValueError:
+                            continue
+                if found:
+                    break
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+
+    if not found:
+        try:
+            for info in socket.getaddrinfo(domain, None, socket.AF_INET):
+                found.add(info[4][0])
+        except (socket.gaierror, OSError):
+            pass
+
+    # www.<domain> часто указывает на другой набор адресов
+    if not domain.startswith("www."):
+        try:
+            for info in socket.getaddrinfo("www." + domain, None, socket.AF_INET):
+                found.add(info[4][0])
+        except (socket.gaierror, OSError):
+            pass
+
+    return sorted(found)
+
+
+def resolve_all(domains):
+    """Параллельный резолв. Возвращает {домен: [ip, ...]}."""
+    out = {}
+    if not domains:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(resolve_domain, d): d for d in domains}
+        for fut in concurrent.futures.as_completed(futures, timeout=60):
+            dom = futures[fut]
+            try:
+                out[dom] = fut.result()
+            except Exception:
+                out[dom] = []
+    return out
+
+
+def expand(entries):
+    """Полный список /32 и подсетей + карта резолва."""
+    nets, domains, bad = classify(entries)
+    resolved = resolve_all(domains)
+    allnets = list(nets)
+    for ips in resolved.values():
+        for ip in ips:
+            cidr = ip + "/32"
+            if cidr not in allnets:
+                allnets.append(cidr)
+    return allnets, resolved, bad
+
+
+# --------------------------------------------------------------------------- #
+# маршрутизация
+# --------------------------------------------------------------------------- #
+def default_gateway():
+    """Реальный шлюз и интерфейс (не туннель)."""
+    rc, out, _ = run([IP, "-j", "route", "show", "default"])
+    if rc == 0 and out:
+        try:
+            for r in json.loads(out):
+                dev = r.get("dev", "")
+                if dev.startswith(("awg", "wg", "tun", "tap")):
+                    continue
+                if r.get("gateway"):
+                    return r["gateway"], dev
+        except (ValueError, KeyError):
+            pass
+    # запасной путь: главный маршрут таблицы main
+    rc, out, _ = run([IP, "route", "show", "table", "main"])
+    for line in out.splitlines():
+        m = re.match(r"default via (\S+) dev (\S+)", line)
+        if m and not m.group(2).startswith(("awg", "wg", "tun")):
+            return m.group(1), m.group(2)
+    return None, None
+
+
+def main_default_is_tunnel():
+    """Стоит ли в таблице main маршрут по умолчанию через туннель."""
+    rc, out, _ = run([IP, "route", "show", "default", "table", "main"])
+    if rc != 0 or not out:
+        return False
+    first = out.splitlines()[0]
+    m = re.search(r"\bdev\s+(\S+)", first)
+    return bool(m and m.group(1).startswith(("awg", "wg", "tun")))
+
+
+def del_rules(priority):
+    for _ in range(1000):
+        rc, _o, _e = run([IP, "rule", "del", "priority", str(priority)])
+        if rc != 0:
+            break
+
+
+def clear_rules():
+    """Полностью убрать всё, что создаёт этот модуль."""
+    del_rules(PRIO_NETS)
+    del_rules(PRIO_REST)
+    run([IP, "route", "flush", "table", str(TABLE_VPN)])
+    run([IP, "route", "flush", "table", str(TABLE_DIRECT)])
+    # маршруты, добавленные версией 1.1 в таблицу main
+    old = load_state()
+    if old.get("mode") == "exclude":
+        for net in old.get("entries", []):
+            try:
+                ipaddress.ip_network(net, strict=False)
+            except ValueError:
+                continue
+            run([IP, "route", "del", net])
+
+
+def build_direct_table():
+    gw, dev = default_gateway()
+    if not dev:
+        raise RuntimeError(
+            "не найден основной сетевой интерфейс — проверьте подключение к сети"
+        )
+    run([IP, "route", "flush", "table", str(TABLE_DIRECT)])
+    cmd = [IP, "route", "add", "default"]
+    if gw:
+        cmd += ["via", gw]
+    cmd += ["dev", dev, "table", str(TABLE_DIRECT)]
+    rc, _o, err = run(cmd)
+    if rc != 0 and "exists" not in err.lower():
+        raise RuntimeError("не удалось создать таблицу обхода: " + err)
+    return gw, dev
+
+
+def build_vpn_table(iface):
+    run([IP, "route", "flush", "table", str(TABLE_VPN)])
+    rc, _o, err = run([IP, "route", "add", "default", "dev", iface,
+                       "table", str(TABLE_VPN)])
+    if rc != 0 and "exists" not in err.lower():
+        raise RuntimeError("не удалось создать таблицу туннеля: " + err)
+
+
+def add_net_rules(nets, table):
+    applied, failed = [], []
+    for net in nets:
+        rc, _o, _e = run([IP, "rule", "add", "to", net, "table", str(table),
+                          "priority", str(PRIO_NETS)])
+        (applied if rc == 0 else failed).append(net)
+    return applied, failed
+
+
+def apply_split(iface, mode, entries, resolve=True):
+    if mode not in ("off", "include", "exclude"):
+        raise ValueError("неизвестный режим: {}".format(mode))
+    if iface and not IFACE_RE.match(iface):
+        raise ValueError("некорректное имя интерфейса")
+
+    state = load_state()
+    clear_rules()
+
+    if mode == "off" or not iface:
+        save_state({"mode": "off", "entries": entries, "iface": "",
+                    "resolved": state.get("resolved", {}),
+                    "auto": state.get("auto", True)})
+        return {"ok": True, "mode": "off", "applied": [], "failed": [],
+                "resolved": {}, "bad": []}
+
+    if resolve:
+        nets, resolved, bad = expand(entries)
+    else:
+        nets, _d, bad = classify(entries)
+        resolved = state.get("resolved", {})
+        for ips in resolved.values():
+            for ip in ips:
+                if ip + "/32" not in nets:
+                    nets.append(ip + "/32")
+
+    if not nets:
+        raise RuntimeError(
+            "список пуст или ни один домен не удалось разрешить в IP"
+        )
+    if len(nets) > 2000:
+        raise RuntimeError("слишком много адресов (максимум 2000)")
+
+    gw, dev = build_direct_table()
+
+    if mode == "include":
+        build_vpn_table(iface)
+        applied, failed = add_net_rules(nets, TABLE_VPN)
+        # Всё остальное — мимо туннеля. Это правило перекрывает перехват
+        # wg-quick (32765), потому что его приоритет меньше.
+        #
+        # Предпочитаем таблицу main: в ней есть маршруты локальной сети
+        # и исходный default. Если же wg-quick положил default туннеля
+        # прямо в main, используем собственную таблицу обхода.
+        rest_table = "main" if not main_default_is_tunnel() else str(TABLE_DIRECT)
+        run([IP, "rule", "add", "from", "all", "table", rest_table,
+             "priority", str(PRIO_REST)])
+    else:
+        applied, failed = add_net_rules(nets, TABLE_DIRECT)
+
+    run([IP, "route", "flush", "cache"])
+
+    save_state({"mode": mode, "entries": entries, "iface": iface,
+                "resolved": resolved, "auto": state.get("auto", True)})
+
+    return {"ok": not failed, "mode": mode, "iface": iface,
+            "applied": applied, "failed": failed,
+            "resolved": resolved, "bad": bad,
+            "gateway": gw, "wan_device": dev, "count": len(nets)}
+
+
+def reapply(iface):
+    """Восстановить правила после переподключения туннеля."""
+    state = load_state()
+    if state["mode"] == "off" or not state.get("auto", True):
+        return {"ok": True, "skipped": True, "mode": state["mode"]}
+    return apply_split(iface, state["mode"], state["entries"], resolve=True)
+
+
+# --------------------------------------------------------------------------- #
+# диагностика
+# --------------------------------------------------------------------------- #
+def verify(target):
+    """Куда реально пойдёт пакет к адресу или домену."""
+    ips = []
+    try:
+        ipaddress.IPv4Address(target)
+        ips = [target]
+    except ValueError:
+        dom = clean_domain(target)
+        if DOMAIN_RE.match(dom):
+            ips = resolve_domain(dom)[:4]
+    if not ips:
+        return {"ok": False, "error": "не удалось определить IP для " + target}
+
+    results = []
+    for ip in ips:
+        rc, out, _ = run([IP, "route", "get", ip])
+        dev = None
+        m = re.search(r"\bdev\s+(\S+)", out)
+        if m:
+            dev = m.group(1)
+        results.append({
+            "ip": ip,
+            "device": dev,
+            "via_vpn": bool(dev and dev.startswith(("awg", "wg", "tun"))),
+            "raw": out.splitlines()[0] if out else "",
+        })
+    return {"ok": True, "target": target, "results": results}
+
+
+def show():
+    state = load_state()
+    _rc, rules, _ = run([IP, "rule", "show"])
+    _rc2, vpn_routes, _ = run([IP, "route", "show", "table", str(TABLE_VPN)])
+    _rc3, dir_routes, _ = run([IP, "route", "show", "table", str(TABLE_DIRECT)])
+    gw, dev = default_gateway()
+    nets, domains, _bad = classify(state["entries"])
+    return {
+        "ok": True,
+        "mode": state["mode"],
+        "entries": state["entries"],
+        "networks": nets,
+        "domains": domains,
+        "resolved": state.get("resolved", {}),
+        "auto": state.get("auto", True),
+        "iface": state.get("iface", ""),
+        "active": str(PRIO_NETS) in rules,
+        "rules_installed": [l for l in rules.splitlines()
+                            if l.startswith((str(PRIO_NETS), str(PRIO_REST)))],
+        "gateway": gw,
+        "wan_device": dev,
+        "table_vpn": vpn_routes.splitlines(),
+        "table_direct": dir_routes.splitlines(),
+    }
+
+
+def main():
+    if os.geteuid() != 0:
+        print(json.dumps({"ok": False, "error": "требуются права root"}))
+        return 3
+
+    args = sys.argv[1:]
+    if not args:
+        print(json.dumps({"ok": False, "error": "не указано действие"}))
+        return 2
+
+    try:
+        cmd = args[0]
+        if cmd == "show":
+            print(json.dumps(show(), ensure_ascii=False))
+        elif cmd == "verify":
+            print(json.dumps(verify(args[1] if len(args) > 1 else ""),
+                             ensure_ascii=False))
+        elif cmd == "clear":
+            clear_rules()
+            st = load_state()
+            st["mode"] = "off"
+            save_state(st)
+            print(json.dumps({"ok": True, "mode": "off"}, ensure_ascii=False))
+        elif cmd == "reapply":
+            print(json.dumps(reapply(args[1] if len(args) > 1 else ""),
+                             ensure_ascii=False))
+        elif cmd == "apply":
+            iface = args[1] if len(args) > 1 else ""
+            mode = args[2] if len(args) > 2 else "off"
+            raw = args[3] if len(args) > 3 else ""
+            entries = [e for e in raw.split(",") if e.strip()]
+            auto = (args[4] if len(args) > 4 else "1") != "0"
+            st = load_state()
+            st["auto"] = auto
+            save_state(st)
+            print(json.dumps(apply_split(iface, mode, entries),
+                             ensure_ascii=False))
+        elif cmd == "resolve":
+            doms = [clean_domain(d) for d in (args[1] or "").split(",") if d.strip()]
+            print(json.dumps({"ok": True, "resolved": resolve_all(doms)},
+                             ensure_ascii=False))
+        else:
+            print(json.dumps({"ok": False, "error": "неизвестное действие"}))
+            return 2
+    except (ValueError, RuntimeError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

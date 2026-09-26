@@ -1,0 +1,45 @@
+#!/bin/bash
+# awg-run-direct — запустить приложение В ОБХОД туннеля AmneziaWG.
+#
+# Раздельное туннелирование по приложениям на Linux требует, чтобы
+# трафик процесса помечался и маршрутизировался отдельно. Самый
+# надёжный способ без модулей ядра — запустить программу от отдельного
+# системного пользователя, чей трафик правилом ip rule направлен
+# напрямую в интернет.
+#
+#   awg-run-direct firefox
+#   awg-run-direct -- curl https://example.com
+#
+set -euo pipefail
+
+DIRECT_USER="awgdirect"
+PRIO=17000
+
+if [ $# -eq 0 ]; then
+    echo "Использование: awg-run-direct <программа> [аргументы...]" >&2
+    echo "Запускает программу в обход VPN-туннеля." >&2
+    exit 2
+fi
+[ "${1:-}" = "--" ] && shift
+
+if ! id "$DIRECT_USER" >/dev/null 2>&1; then
+    echo "Пользователь $DIRECT_USER не найден. Выполните однократную настройку:" >&2
+    echo "  sudo awg-setup-direct" >&2
+    exit 1
+fi
+
+UID_DIRECT=$(id -u "$DIRECT_USER")
+
+# правило: трафик этого uid идёт по таблице main в обход туннеля
+if ! ip rule show | grep -q "uidrange ${UID_DIRECT}-${UID_DIRECT}"; then
+    echo "Правило маршрутизации отсутствует, добавляю (нужен sudo)…" >&2
+    sudo ip rule add uidrange "${UID_DIRECT}-${UID_DIRECT}" \
+        lookup main suppress_prefixlength 0 priority "$PRIO"
+fi
+
+# доступ к X/Wayland для GUI-приложений
+if command -v xhost >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
+    xhost "+si:localuser:$DIRECT_USER" >/dev/null 2>&1 || true
+fi
+
+exec sudo -u "$DIRECT_USER" --preserve-env=DISPLAY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR "$@"

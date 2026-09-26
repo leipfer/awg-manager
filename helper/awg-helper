@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+awg-helper — привилегированный backend для AWG Manager.
+
+Запускается от root через pkexec (правило polkit разрешает это
+активному локальному пользователю без пароля).
+
+Действия:
+    list                      — список конфигов + их состояние (JSON)
+    status [IFACE]            — полный статус (JSON)
+    monitor [INTERVAL]        — поток JSON-строк со статусом
+    up IFACE                  — systemctl start awg-quick@IFACE
+    switch IFACE              — поднять IFACE, опустив все остальные (эксклюзивно)
+    down IFACE                — systemctl stop awg-quick@IFACE
+    restart IFACE             — перезапуск туннеля
+    down-all                  — опустить все активные интерфейсы
+    enable IFACE / disable IFACE — автозапуск при загрузке системы
+    logs IFACE [N]            — последние N строк журнала юнита
+    split-show                — состояние раздельного туннелирования
+    split-apply IFACE MODE NETS — применить раздельное туннелирование
+"""
+
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+CONF_DIR = "/etc/amnezia/amneziawg"
+UNIT_TMPL = "awg-quick@{}.service"
+IFACE_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
+
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+AWG = shutil.which("awg")
+SYSTEMCTL = shutil.which("systemctl") or "/usr/bin/systemctl"
+IP = shutil.which("ip") or "/usr/sbin/ip"
+JOURNALCTL = shutil.which("journalctl") or "/usr/bin/journalctl"
+
+
+# --------------------------------------------------------------------------- #
+# утилиты
+# --------------------------------------------------------------------------- #
+def run(cmd, timeout=25):
+    """Выполнить команду, вернуть (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    except subprocess.TimeoutExpired:
+        return 124, "", "команда превысила время ожидания"
+
+
+def die(msg, code=1):
+    print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+    sys.exit(code)
+
+
+def valid_iface(name):
+    """Интерфейс валиден, только если для него есть конфиг в CONF_DIR."""
+    if not name or not IFACE_RE.match(name) or name in (".", ".."):
+        return False
+    return os.path.isfile(os.path.join(CONF_DIR, name + ".conf"))
+
+
+def list_configs():
+    try:
+        files = sorted(glob.glob(os.path.join(CONF_DIR, "*.conf")))
+    except OSError:
+        return []
+    out = []
+    for f in files:
+        name = os.path.basename(f)[:-5]
+        if IFACE_RE.match(name):
+            out.append(name)
+    return out
+
+
+def active_interfaces():
+    if not AWG:
+        return []
+    rc, out, _ = run([AWG, "show", "interfaces"], timeout=8)
+    if rc != 0 or not out:
+        return []
+    return out.split()
+
+
+def unit_state(iface):
+    unit = UNIT_TMPL.format(iface)
+    _, active, _ = run([SYSTEMCTL, "is-active", unit], timeout=8)
+    _, enabled, _ = run([SYSTEMCTL, "is-enabled", unit], timeout=8)
+    return {"active": active or "unknown", "enabled": enabled or "unknown"}
+
+
+def iface_addresses(iface):
+    rc, out, _ = run([IP, "-j", "addr", "show", "dev", iface], timeout=8)
+    addrs, mtu = [], None
+    if rc == 0 and out:
+        try:
+            data = json.loads(out)
+            for link in data:
+                mtu = link.get("mtu")
+                for a in link.get("addr_info", []):
+                    if a.get("local"):
+                        addrs.append("{}/{}".format(a["local"], a.get("prefixlen", "")))
+        except (ValueError, KeyError, TypeError):
+            pass
+    return addrs, mtu
+
+
+def conf_meta(iface):
+    """Читаем из конфига только безопасные поля (без ключей)."""
+    path = os.path.join(CONF_DIR, iface + ".conf")
+    meta = {"dns": None, "address": None, "endpoint": None, "mtu": None}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip().lower()
+                v = v.strip()
+                if k in meta and meta[k] is None:
+                    meta[k] = v
+    except OSError:
+        pass
+    return meta
+
+
+def parse_dump(iface):
+    """Разбор `awg show IFACE dump`. Приватный ключ наружу не отдаём."""
+    info = {"public_key": None, "listen_port": None, "fwmark": None, "peers": []}
+    if not AWG:
+        return info
+    rc, out, _ = run([AWG, "show", iface, "dump"], timeout=10)
+    if rc != 0 or not out:
+        return info
+    lines = out.splitlines()
+    head = lines[0].split("\t")
+    if len(head) >= 4:
+        info["public_key"] = head[1]
+        info["listen_port"] = head[2]
+        info["fwmark"] = None if head[3] in ("off", "0") else head[3]
+    for line in lines[1:]:
+        f = line.split("\t")
+        if len(f) < 8:
+            continue
+        try:
+            hs = int(f[4])
+            rx = int(f[5])
+            tx = int(f[6])
+        except ValueError:
+            hs, rx, tx = 0, 0, 0
+        info["peers"].append(
+            {
+                "public_key": f[0],
+                "has_psk": f[1] not in ("(none)", "none", ""),
+                "endpoint": None if f[2] == "(none)" else f[2],
+                "allowed_ips": [] if f[3] in ("(none)", "") else f[3].split(","),
+                "latest_handshake": hs,
+                "rx": rx,
+                "tx": tx,
+                "keepalive": None if f[7] in ("off", "0") else f[7],
+            }
+        )
+    return info
+
+
+def build_status(want_iface=None):
+    configs = list_configs()
+    up = [i for i in active_interfaces() if i in configs or True]
+    status = {
+        "ok": True,
+        "ts": time.time(),
+        "awg_found": bool(AWG),
+        "conf_dir": CONF_DIR,
+        "configs": [],
+        "up": up,
+        "interfaces": {},
+    }
+
+    for name in configs:
+        st = unit_state(name)
+        status["configs"].append(
+            {
+                "name": name,
+                "up": name in up,
+                "active": st["active"],
+                "enabled": st["enabled"],
+            }
+        )
+
+    targets = [want_iface] if want_iface else up
+    for name in targets:
+        if not name:
+            continue
+        det = parse_dump(name)
+        addrs, mtu = iface_addresses(name)
+        det["addresses"] = addrs
+        det["mtu"] = mtu
+        det["up"] = name in up
+        det["systemd"] = unit_state(name)
+        det["conf"] = conf_meta(name) if name in configs else {}
+        status["interfaces"][name] = det
+
+    return status
+
+
+# --------------------------------------------------------------------------- #
+# действия
+# --------------------------------------------------------------------------- #
+def action_unit(verb, iface):
+    if not valid_iface(iface):
+        die("Неизвестный интерфейс: {}".format(iface), 2)
+    unit = UNIT_TMPL.format(iface)
+    rc, out, err = run([SYSTEMCTL, verb, unit], timeout=60)
+
+    if rc == 0 and verb in ("start", "restart"):
+        split_reapply(iface)
+    elif rc == 0 and verb == "stop":
+        split_clear()
+
+    result = {
+        "ok": rc == 0,
+        "action": verb,
+        "iface": iface,
+        "rc": rc,
+        "stdout": out,
+        "stderr": err,
+    }
+    if rc != 0 and not err:
+        _, jout, _ = run([JOURNALCTL, "-u", unit, "-n", "20", "--no-pager"], timeout=15)
+        result["stderr"] = jout
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if rc == 0 else 1)
+
+
+def action_switch(iface):
+    """
+    Эксклюзивное подключение: сначала опускаем все прочие туннели,
+    затем поднимаем нужный. Так исключается одновременная работа
+    нескольких интерфейсов с пересекающимися маршрутами.
+    """
+    if not valid_iface(iface):
+        die("Неизвестный интерфейс: {}".format(iface), 2)
+
+    stopped = []
+    for other in active_interfaces():
+        if other == iface:
+            continue
+        rc, _out, _err = run([SYSTEMCTL, "stop", UNIT_TMPL.format(other)], timeout=60)
+        stopped.append({"iface": other, "rc": rc})
+
+    unit = UNIT_TMPL.format(iface)
+    if iface in active_interfaces():
+        print(json.dumps(
+            {"ok": True, "action": "switch", "iface": iface,
+             "stopped": stopped, "already_up": True}, ensure_ascii=False))
+        return
+
+    rc, out, err = run([SYSTEMCTL, "start", unit], timeout=60)
+    if rc != 0 and not err:
+        _, jout, _ = run([JOURNALCTL, "-u", unit, "-n", "20", "--no-pager"], timeout=15)
+        err = jout
+
+    split = split_reapply(iface) if rc == 0 else None
+
+    print(json.dumps(
+        {"ok": rc == 0, "action": "switch", "iface": iface, "rc": rc,
+         "stopped": stopped, "stdout": out, "stderr": err,
+         "split": split}, ensure_ascii=False))
+    sys.exit(0 if rc == 0 else 1)
+
+
+def action_down_all():
+    results = []
+    ok = True
+    for iface in active_interfaces():
+        if not valid_iface(iface):
+            continue
+        rc, out, err = run([SYSTEMCTL, "stop", UNIT_TMPL.format(iface)], timeout=60)
+        ok = ok and rc == 0
+        results.append({"iface": iface, "rc": rc, "stderr": err})
+    split_clear()
+    print(json.dumps({"ok": ok, "action": "down-all", "results": results}, ensure_ascii=False))
+
+
+def action_monitor(interval):
+    interval = max(0.5, min(interval, 30.0))
+    try:
+        while True:
+            sys.stdout.write(json.dumps(build_status(), ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            time.sleep(interval)
+    except (BrokenPipeError, KeyboardInterrupt):
+        sys.exit(0)
+
+
+def action_logs(iface, n):
+    if not valid_iface(iface):
+        die("Неизвестный интерфейс: {}".format(iface), 2)
+    n = max(1, min(n, 500))
+    rc, out, err = run(
+        [JOURNALCTL, "-u", UNIT_TMPL.format(iface), "-n", str(n), "--no-pager"],
+        timeout=20,
+    )
+    print(json.dumps({"ok": rc == 0, "logs": out or err}, ensure_ascii=False))
+
+
+SPLIT_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "awg-split")
+
+
+def split_reapply(iface):
+    """Восстановить правила раздельного туннелирования после подъёма туннеля."""
+    if not os.path.exists(SPLIT_BIN):
+        return None
+    try:
+        rc, out, _err = run([sys.executable, SPLIT_BIN, "reapply", iface], timeout=90)
+        return json.loads(out) if out else None
+    except (ValueError, OSError):
+        return None
+
+
+def split_clear():
+    if not os.path.exists(SPLIT_BIN):
+        return
+    try:
+        run([sys.executable, SPLIT_BIN, "clear"], timeout=30)
+    except OSError:
+        pass
+
+
+def action_split(cmd, rest):
+    """Делегируем раздельное туннелирование модулю awg-split."""
+    if not os.path.exists(SPLIT_BIN):
+        die("модуль awg-split не установлен", 2)
+    if cmd == "split-show":
+        argv = [sys.executable, SPLIT_BIN, "show"]
+    elif cmd == "split-verify":
+        argv = [sys.executable, SPLIT_BIN, "verify", rest[0] if rest else ""]
+    elif cmd == "split-resolve":
+        argv = [sys.executable, SPLIT_BIN, "resolve", rest[0] if rest else ""]
+    else:
+        iface = rest[0] if rest else ""
+        mode = rest[1] if len(rest) > 1 else "off"
+        nets = rest[2] if len(rest) > 2 else ""
+        auto = rest[3] if len(rest) > 3 else "1"
+        if iface and not valid_iface(iface):
+            die("Неизвестный интерфейс: {}".format(iface), 2)
+        argv = [sys.executable, SPLIT_BIN, "apply", iface, mode, nets, auto]
+    rc, out, err = run(argv, timeout=120)
+    if out:
+        print(out)
+    else:
+        print(json.dumps({"ok": rc == 0, "error": err}, ensure_ascii=False))
+    sys.exit(0 if rc == 0 else 1)
+
+
+def main():
+    if os.geteuid() != 0:
+        die("awg-helper должен запускаться от root (через pkexec)", 3)
+
+    args = sys.argv[1:]
+    if not args:
+        die("не указано действие", 2)
+    cmd = args[0]
+
+    if cmd == "list":
+        print(json.dumps({"ok": True, "configs": list_configs()}, ensure_ascii=False))
+    elif cmd == "status":
+        iface = args[1] if len(args) > 1 else None
+        if iface and not valid_iface(iface):
+            die("Неизвестный интерфейс: {}".format(iface), 2)
+        print(json.dumps(build_status(iface), ensure_ascii=False))
+    elif cmd == "monitor":
+        try:
+            interval = float(args[1]) if len(args) > 1 else 1.0
+        except ValueError:
+            interval = 1.0
+        action_monitor(interval)
+    elif cmd in ("up", "start"):
+        action_unit("start", args[1] if len(args) > 1 else "")
+    elif cmd == "switch":
+        action_switch(args[1] if len(args) > 1 else "")
+    elif cmd in ("down", "stop"):
+        action_unit("stop", args[1] if len(args) > 1 else "")
+    elif cmd == "restart":
+        action_unit("restart", args[1] if len(args) > 1 else "")
+    elif cmd == "down-all":
+        action_down_all()
+    elif cmd == "enable":
+        action_unit("enable", args[1] if len(args) > 1 else "")
+    elif cmd == "disable":
+        action_unit("disable", args[1] if len(args) > 1 else "")
+    elif cmd in ("split-show", "split-apply", "split-verify", "split-resolve"):
+        action_split(cmd, args[1:])
+    elif cmd == "logs":
+        try:
+            n = int(args[2]) if len(args) > 2 else 60
+        except ValueError:
+            n = 60
+        action_logs(args[1] if len(args) > 1 else "", n)
+    else:
+        die("неизвестное действие: {}".format(cmd), 2)
+
+
+if __name__ == "__main__":
+    main()

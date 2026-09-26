@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    if which gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+    if which update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    fi
+    # перезагрузить правила polkit
+    systemctl reload polkit 2>/dev/null || systemctl restart polkit 2>/dev/null || true
+
+    if [ ! -d /etc/amnezia/amneziawg ]; then
+        echo "ВНИМАНИЕ: каталог /etc/amnezia/amneziawg не найден." >&2
+    fi
+    if ! which awg >/dev/null 2>&1; then
+        echo "ВНИМАНИЕ: команда 'awg' не найдена — установите amneziawg-tools." >&2
+    fi
+fi
+exit 0

@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Диагностика окружения AWG Manager: версии библиотек и доступность API."""
+import os, shutil, subprocess, sys, time
+
+sys.path.insert(0, "/usr/share/awg-manager")
+print("=== AWG Manager · диагностика ===\n")
+
+print("Python:", sys.version.split()[0])
+for name in ("pkexec", "awg", "ip", "dig", "systemctl", "notify-send"):
+    print("  {:12} {}".format(name, shutil.which(name) or "НЕ НАЙДЕН"))
+
+print("\n--- GTK / libadwaita ---")
+try:
+    import gi
+    gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gtk
+    print("  GTK        {}.{}.{}".format(
+        Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()))
+    print("  libadwaita {}.{}.{}".format(
+        Adw.get_major_version(), Adw.get_minor_version(), Adw.get_micro_version()))
+    checks = [
+        ("Adw.SwitchRow", hasattr(Adw, "SwitchRow"), "libadwaita 1.4"),
+        ("Adw.SpinRow", hasattr(Adw, "SpinRow"), "libadwaita 1.4"),
+        ("Adw.Banner", hasattr(Adw, "Banner"), "libadwaita 1.3"),
+        ("Adw.MessageDialog", hasattr(Adw, "MessageDialog"), "libadwaita 1.2"),
+        ("ActionRow.set_subtitle_lines",
+         hasattr(Adw.ActionRow, "set_subtitle_lines"), "libadwaita 1.3"),
+        ("Gtk.FileDialog", hasattr(Gtk, "FileDialog"), "GTK 4.10"),
+    ]
+    print("\n  API, используемые приложением:")
+    for name, ok, need in checks:
+        print("    {:32} {}  (нужно: {})".format(name, "есть" if ok else "НЕТ", need))
+except Exception as exc:
+    print("  ОШИБКА импорта GTK:", exc)
+
+print("\n--- AppIndicator (трей) ---")
+try:
+    import gi
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1"); print("  Ayatana: есть")
+    except ValueError:
+        gi.require_version("AppIndicator3", "0.1"); print("  AppIndicator3: есть")
+except Exception:
+    print("  НЕТ — установите gir1.2-ayatanaappindicator3-0.1")
+
+print("\n--- Хелпер ---")
+helper = "/usr/libexec/awg-manager/awg-helper"
+print("  {}: {}".format(helper, "есть" if os.path.exists(helper) else "НЕ НАЙДЕН"))
+if os.path.exists(helper) and shutil.which("pkexec"):
+    print("  Проверка pkexec (может запросить пароль)…")
+    t = time.time()
+    try:
+        p = subprocess.run(["pkexec", helper, "list"], capture_output=True,
+                           text=True, timeout=20)
+        print("    код {} за {:.1f} с".format(p.returncode, time.time() - t))
+        print("    ответ:", (p.stdout or p.stderr).strip()[:200])
+    except subprocess.TimeoutExpired:
+        print("    ТАЙМАУТ 20 с — polkit не отвечает")
+
+print("\n--- Раздельное туннелирование ---")
+try:
+    from awgmanager import presets
+    print("  наборов доступно:", len(presets.all_sets()))
+    for s in presets.all_sets():
+        print("    - {} ({} записей)".format(s["name"], len(s["entries"])))
+except Exception as exc:
+    print("  ОШИБКА:", exc)
+
+print("\nГотово.")

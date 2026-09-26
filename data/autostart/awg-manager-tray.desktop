@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AmneziaWG Tray
+Name[ru]=AmneziaWG (значок в трее)
+Comment=Индикатор состояния туннеля AmneziaWG
+Exec=awg-manager-tray
+Icon=awg-manager
+Terminal=false
+Categories=Network;
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

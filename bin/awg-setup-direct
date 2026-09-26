@@ -1,0 +1,25 @@
+#!/bin/bash
+# Однократная настройка обхода туннеля по приложениям.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "Запустите через sudo" >&2; exit 1; }
+
+DIRECT_USER="awgdirect"
+if id "$DIRECT_USER" >/dev/null 2>&1; then
+    echo "Пользователь $DIRECT_USER уже существует."
+else
+    useradd --system --create-home --shell /bin/bash "$DIRECT_USER"
+    echo "Создан системный пользователь $DIRECT_USER."
+fi
+
+UID_DIRECT=$(id -u "$DIRECT_USER")
+if ! ip rule show | grep -q "uidrange ${UID_DIRECT}-${UID_DIRECT}"; then
+    ip rule add uidrange "${UID_DIRECT}-${UID_DIRECT}" \
+        lookup main suppress_prefixlength 0 priority 17000
+fi
+
+echo
+echo "Готово. Теперь запускайте приложения мимо VPN так:"
+echo "  awg-run-direct firefox"
+echo
+echo "Правило ip rule не переживает перезагрузку — awg-run-direct"
+echo "восстановит его автоматически при следующем запуске."

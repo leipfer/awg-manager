@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=AmneziaWG Manager
+Name[ru]=AmneziaWG Менеджер
+GenericName=VPN Tunnel Manager
+Comment=Управление туннелями AmneziaWG
+Comment[en]=Manage AmneziaWG tunnels
+Exec=awg-manager
+Icon=awg-manager
+Terminal=false
+Categories=Network;Security;GTK;
+Keywords=vpn;amnezia;wireguard;awg;tunnel;
+StartupNotify=true
+StartupWMClass=org.awgmanager.AwgManager

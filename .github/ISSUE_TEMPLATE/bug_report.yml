@@ -1,0 +1,40 @@
+name: Сообщить об ошибке
+description: Что-то работает не так
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло
+      description: Опишите проблему и что вы ожидали увидеть
+    validations: {required: true}
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги для воспроизведения
+      placeholder: |
+        1. Открыть приложение
+        2. Нажать …
+        3. Наблюдается …
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes:
+      label: Версия пакета
+      placeholder: "dpkg -l awg-manager | tail -1"
+    validations: {required: true}
+  - type: input
+    id: distro
+    attributes:
+      label: Дистрибутив и окружение
+      placeholder: "Ubuntu 26.04, GNOME/Wayland"
+    validations: {required: true}
+  - type: textarea
+    id: logs
+    attributes:
+      label: Вывод диагностики
+      description: |
+        Приложите вывод команд (уберите приватные ключи и реальные IP):
+        `awg-manager` из терминала и
+        `sudo /usr/libexec/awg-manager/awg-helper status`
+      render: shell
