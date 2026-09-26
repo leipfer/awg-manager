@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Собрать пакет
-        run: ./build.sh
+        run: bash build.sh
       - name: Проверить пакет
         run: |
           sudo apt-get install -y lintian
@@ -65,7 +65,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: ./build.sh "${GITHUB_REF_NAME#v}"
+      - run: bash build.sh "${GITHUB_REF_NAME#v}"
       - uses: softprops/action-gh-release@v2
         with:
           files: '*.deb'
